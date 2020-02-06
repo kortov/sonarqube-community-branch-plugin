@@ -110,13 +110,13 @@ public class GitlabServerPullRequestDecorator implements PullRequestBuildStatusD
             final String projectURL = restURL + String.format("/projects/%s", URLEncoder.encode(repositorySlug, StandardCharsets.UTF_8.name()));
             final String statusUrl = projectURL + String.format("/statuses/%s", revision);
             final String mergeRequestURl = projectURL + String.format("/merge_requests/%s", pullRequestId);
-            final String prCommitsURL = mergeRequestURl + "/commits";
-            final String mergeRequestDiscussionURL = mergeRequestURl + "/discussions";
+            final String mrCommitsURL = mergeRequestURl + "/commits";
+            final String mrDiscussionURL = mergeRequestURl + "/discussions";
 
 
             LOGGER.info(String.format("Status url is: %s ", statusUrl));
-            LOGGER.info(String.format("PR commits url is: %s ", prCommitsURL));
-            LOGGER.info(String.format("MR discussion url is: %s ", mergeRequestDiscussionURL));
+            LOGGER.info(String.format("MR commits url is: %s ", mrCommitsURL));
+            LOGGER.info(String.format("MR discussion url is: %s ", mrDiscussionURL));
             LOGGER.info(String.format("User url is: %s ", userURL));
 
             Map<String, String> headers = new HashMap<>();
@@ -126,11 +126,11 @@ public class GitlabServerPullRequestDecorator implements PullRequestBuildStatusD
             User user = getSingle(userURL, headers, User.class);
             LOGGER.info(String.format("Using user: %s ", user.getUsername()));
 
-            List<String> commits = getPagedList(prCommitsURL, headers, deleteCommentsEnabled, new TypeReference<List<Commit>>() {
+            List<String> commits = getPagedList(mrCommitsURL, headers, deleteCommentsEnabled, new TypeReference<List<Commit>>() {
             }).stream().map(Commit::getId).collect(Collectors.toList());
             MergeRequest mergeRequest = getSingle(mergeRequestURl, headers, MergeRequest.class);
 
-            List<Discussion> discussions = getPagedList(mergeRequestDiscussionURL, headers, deleteCommentsEnabled, new TypeReference<List<Discussion>>() {
+            List<Discussion> discussions = getPagedList(mrDiscussionURL, headers, deleteCommentsEnabled, new TypeReference<List<Discussion>>() {
             });
 
             LOGGER.info(String.format("Discussions in MR: %s ", discussions
@@ -138,17 +138,21 @@ public class GitlabServerPullRequestDecorator implements PullRequestBuildStatusD
                     .map(Discussion::getId)
                     .collect(Collectors.joining(", "))));
 
-            for (Discussion discussion : discussions) {
-                for (Note note : discussion.getNotes()) {
-                    if (!note.isSystem() && note.getAuthor() != null && note.getAuthor().getUsername().equals(user.getUsername())) {
-                        //delete only our own comments
-                        deleteCommitDiscussionNote(mergeRequestDiscussionURL + String.format("/%s/notes/%s",
-                                discussion.getId(),
-                                note.getId()),
-                                headers, deleteCommentsEnabled);
+            if (deleteCommentsEnabled) {
+                for (Discussion discussion : discussions) {
+                    for (Note note : discussion.getNotes()) {
+                        if (!note.isSystem() && note.getAuthor() != null && note.getAuthor().getUsername().equals(user.getUsername())) {
+                            //delete only our own comments
+                            deleteCommitDiscussionNote(mrDiscussionURL + String.format("/%s/notes/%s",
+                                    discussion.getId(),
+                                    note.getId()),
+                                    headers);
+                        }
                     }
                 }
             }
+
+
 
             QualityGate.Condition newCoverageCondition = analysis.findQualityGateCondition(CoreMetrics.NEW_COVERAGE_KEY)
                     .orElseThrow(() -> new IllegalStateException("Could not find New Coverage Condition in analysis"));
@@ -162,7 +166,7 @@ public class GitlabServerPullRequestDecorator implements PullRequestBuildStatusD
 
             postStatus(statusUrl, headers, analysis, coverageValue, true);
 
-            postCommitComment(mergeRequestDiscussionURL, headers, summaryContentParams, summaryCommentEnabled);
+            postCommitComment(mrDiscussionURL, headers, summaryContentParams, summaryCommentEnabled);
 
             for (PostAnalysisIssueVisitor.ComponentIssue issue : openIssues) {
                 String path = analysis.getSCMPathForIssue(issue).orElse(null);
@@ -185,7 +189,7 @@ public class GitlabServerPullRequestDecorator implements PullRequestBuildStatusD
                                 new BasicNameValuePair("position[new_path]", path),
                                 new BasicNameValuePair("position[new_line]", String.valueOf(issue.getIssue().getLine())),
                                 new BasicNameValuePair("position[position_type]", "text"));
-                        postCommitComment(mergeRequestDiscussionURL, headers, fileContentParams, fileCommentEnabled);
+                        postCommitComment(mrDiscussionURL, headers, fileContentParams, fileCommentEnabled);
                     } else {
                         LOGGER.info(String.format("Skipping %s:%d since the commit does not belong to the MR", path, issue.getIssue().getLine()));
                     }
@@ -230,7 +234,7 @@ public class GitlabServerPullRequestDecorator implements PullRequestBuildStatusD
             httpGet.addHeader(entry.getKey(), entry.getValue());
         }
 
-        List<X> discussions = new ArrayList<>();
+        List<X> entities = new ArrayList<>();
 
         if (sendRequest) {
             HttpResponse httpResponse = HttpClients.createDefault().execute(httpGet);
@@ -246,31 +250,28 @@ public class GitlabServerPullRequestDecorator implements PullRequestBuildStatusD
                         .configure(DeserializationFeature.ACCEPT_SINGLE_VALUE_AS_ARRAY, true)
                         .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
                         .readValue(IOUtils.toString(entity.getContent(), StandardCharsets.UTF_8), typeRef);
-                discussions.addAll(pagedDiscussions);
-                LOGGER.info("MR discussions received");
+                entities.addAll(pagedDiscussions);
+                LOGGER.info("MR entities {} received", typeRef.getType().getTypeName());
                 Optional<String> nextURL = getNextUrl(httpResponse);
                 if (nextURL.isPresent()) {
                     LOGGER.info("Getting next page");
-                    discussions.addAll(getPagedList(nextURL.get(), headers, sendRequest, typeRef));
+                    entities.addAll(getPagedList(nextURL.get(), headers, sendRequest, typeRef));
                 }
             }
         }
-        return discussions;
+        return entities;
     }
 
-    private void deleteCommitDiscussionNote(String commitDiscussionNoteURL, Map<String, String> headers, boolean sendRequest) throws IOException {
+    private void deleteCommitDiscussionNote(String commitDiscussionNoteURL, Map<String, String> headers) throws IOException {
         //https://docs.gitlab.com/ee/api/discussions.html#delete-a-commit-thread-note
         HttpDelete httpDelete = new HttpDelete(commitDiscussionNoteURL);
         for (Map.Entry<String, String> entry : headers.entrySet()) {
             httpDelete.addHeader(entry.getKey(), entry.getValue());
         }
 
-        if (sendRequest) {
-            LOGGER.info("Deleting {} with headers {}", commitDiscussionNoteURL, headers);
-
-            HttpResponse httpResponse = HttpClients.createDefault().execute(httpDelete);
-            validateGitlabResponse(httpResponse, 204, "Commit discussions note deleted");
-        }
+        LOGGER.info("Deleting {} with headers {}", commitDiscussionNoteURL, headers);
+        HttpResponse httpResponse = HttpClients.createDefault().execute(httpDelete);
+        validateGitlabResponse(httpResponse, 204, "Commit discussions note deleted");
     }
 
     private void postCommitComment(String commitCommentUrl, Map<String, String> headers, List<NameValuePair> params, boolean sendRequest) throws IOException {
